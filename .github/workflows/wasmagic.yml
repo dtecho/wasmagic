@@ -1,0 +1,151 @@
+name: Wasm Magic Factory
+
+on:
+  workflow_dispatch: # Allow manual trigger of this workflow
+
+jobs:
+  convert-repos-to-wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout THIS repository (Wasm Magic Factory)
+      - name: Checkout This Repository
+        uses: actions/checkout@v4
+
+      # Step 2: Setup Emscripten (for C/C++ projects)
+      - name: Setup Emscripten
+        run: |
+          echo "Setting up Emscripten SDK..."
+          git clone https://github.com/emscripten-core/emsdk.git
+          cd emsdk
+          ./emsdk install latest
+          ./emsdk activate latest
+          echo "EMSDK=$(pwd)" >> $GITHUB_ENV
+          echo "$(pwd)" >> $GITHUB_PATH
+          echo "$(pwd)/upstream/emscripten" >> $GITHUB_PATH
+
+      # Step 3: Read the 'convert-me' File and Process Each Repository
+      - name: Read Target Repositories
+        run: |
+          echo "Reading repositories from .wasmagic/convert-me..."
+
+          # Source emsdk environment if it exists
+          if [ -d "emsdk" ]; then
+            cd emsdk && source ./emsdk_env.sh && cd ..
+          fi
+
+          # Read the URLs from the file
+          while IFS= read -r repo_url || [[ -n "$repo_url" ]]; do
+            echo "Processing repository: $repo_url"
+
+            # Extract repository name from URL
+            repo_name=$(basename -s .git "$repo_url")
+            echo "Repository name: $repo_name"
+
+            # Clone the repository into {{target_repo}}
+            echo "Cloning $repo_url into $repo_name..."
+            git clone --depth=1 "$repo_url" "$repo_name"
+
+            # Create an output folder for Wasm artifacts: {{target_repo}}_wasm
+            mkdir -p "${repo_name}_wasm"
+
+            # Compile the repository to Wasm
+            echo "Compiling $repo_name to WebAssembly..."
+            if [ -f "$repo_name/Cargo.toml" ]; then
+              # Rust project
+              echo "Detected Rust project. Compiling..."
+              cd "$repo_name"
+              rustup target add wasm32-unknown-unknown
+              cargo build --release --target wasm32-unknown-unknown
+              cd ..
+
+              # Copy the compiled Wasm binary to the output folder
+              wasm_path="$repo_name/target/wasm32-unknown-unknown/release/"
+              if ls "${wasm_path}"*.wasm 1> /dev/null 2>&1; then
+                cp "${wasm_path}"*.wasm "${repo_name}_wasm/"
+              else
+                echo "No .wasm files found in target directory for $repo_name"
+              fi
+            elif [ -f "$repo_name/Makefile" ] || \
+                 [ -f "$repo_name/CMakeLists.txt" ]; then
+              # C/C++ project
+              echo "Detected C/C++ project. Compiling..."
+              cd "$repo_name"
+
+              # Apply Emscripten compatibility patch for C/C++ projects
+              if [ -f "opencog/util/platform.cc" ]; then
+                echo "Applying Emscripten patch to opencog/util/platform.cc"
+                
+                # Insert Emscripten section before the Linux section (before #else // __APPLE__)
+                # This adds a dedicated #elif __EMSCRIPTEN__ block with stub implementations
+                sed -i '/#else \/\/ __APPLE__/i #elif defined(__EMSCRIPTEN__)\n\nuint64_t opencog::getTotalRAM()\n{\n    return 0;\n}\n\nuint64_t opencog::getFreeRAM()\n{\n    return 0;\n}\n\nvoid opencog::set_thread_name(const char* name)\n{\n    \/\/ Not supported in WebAssembly\n}\n' opencog/util/platform.cc
+              fi
+              
+              # Try to compile with emscripten
+              if [ -f "CMakeLists.txt" ]; then
+                emcmake cmake . && emmake make
+              elif [ -f "Makefile" ]; then
+                emmake make
+              fi
+              cd ..
+
+              # Copy generated Wasm (try multiple common locations)
+              wasm_found=false
+              for wasm_dir in "$repo_name/build" "$repo_name" \
+                              "$repo_name/out" "$repo_name/dist"; do
+                if ls "$wasm_dir/"*.wasm 1> /dev/null 2>&1; then
+                  cp "$wasm_dir/"*.wasm "${repo_name}_wasm/"
+                  wasm_found=true
+                  break
+                fi
+              done
+              
+              # Special case for static library build with emscripten
+              if [ "$wasm_found" = false ] && [ -f "$repo_name/CMakeLists.txt" ]; then
+                echo "Attempting to compile a simple main.c to link the static library."
+                # Create a simple main.c to link the static library
+                cat > "$repo_name/main.c" << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          
+          int main() {
+              printf("Hello from Wasm Magic Factory\n");
+              return 0;
+          }
+          EOF
+                
+                # Find the static library
+                static_lib=$(find "$repo_name" -name "*.a" -print -quit)
+                
+                if [ -n "$static_lib" ]; then
+                  echo "Found static library: $static_lib"
+                  # Compile and link
+                  emcc "$repo_name/main.c" "$static_lib" -o "${repo_name}_wasm/a.out.js"
+                  if [ -f "${repo_name}_wasm/a.out.wasm" ]; then
+                    wasm_found=true
+                    echo "Successfully compiled and linked to a.out.wasm"
+                  fi
+                else
+                  echo "No static library found to link."
+                fi
+              fi
+
+              if [ "$wasm_found" = false ]; then
+                echo "No .wasm files found for C/C++ project $repo_name"
+              fi
+            else
+              echo "Unknown project type for $repo_name. Skipping..."
+              continue
+            fi
+
+            echo "Compilation complete for $repo_name."
+            echo "Wasm artifacts stored in ${repo_name}_wasm."
+          done < .wasmagic/convert-me
+
+      # Step 4: Archive All Generated Wasm Artifacts
+      - name: Upload All Wasm Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-wasm-artifacts
+          path: |
+            *_wasm/
